@@ -59,33 +59,52 @@ KNOWLEDGE_BASE_DIR = Path(__file__).parent / "knowledge_base"
 # How many document chunks to hand back to the model for a single search.
 # Too few and the answer misses context; too many and the model gets
 # distracted by irrelevant text and is more likely to invent something.
-SEARCH_TOP_K = 3
+#
+# Was 3. Raised to 5 after the evaluation found a false refusal: asked
+# "how quickly do we respond to a P1?", the model searched "the SLA for
+# a P1 ticket" and the P1 chunk came 4th - scoring 0.391 against 0.395
+# for P2. Embeddings are poor at telling short codes like P1 and P2
+# apart, so the four priority chunks score within a few hundredths of
+# each other and their order is close to random. With only 3 slots, the
+# right one could be cut off and the assistant would then (correctly,
+# given what it was shown) say it could not find the answer.
+#
+# The rule this follows: top-k must be larger than the biggest family of
+# near-identical chunks. There are four priority levels, so 5. The
+# embedding does rough recall; the model, which reads "P1" perfectly
+# well, picks the right chunk from the ones returned. The cost is two
+# extra short chunks per search - roughly 250 tokens.
+SEARCH_TOP_K = 5
 
 # The similarity floor. Chunks scoring below this are thrown away before
 # the model ever sees them.
 #
-# This is the single most important number in the project. Embedding
-# similarity always returns *something* - even a question about parking,
-# which our knowledge base says nothing about, will return the three
-# "least unrelated" chunks with scores around 0.2-0.3. Without a floor,
-# the model receives that noise and is tempted to construct a plausible
-# sounding policy out of it. That is exactly the hallucination the case
-# study warns about.
+# Similarity search always returns a ranking, even when nothing in the
+# corpus is relevant, so without a floor the model can be handed
+# unrelated text and tempted to build an answer out of it.
 #
-# PROVISIONAL VALUE - not yet measured against this corpus.
+# MEASURED, not guessed. Run evaluate.py to reproduce. On this corpus:
 #
-# 0.35 is a starting point based on how text-embedding-3 models usually
-# behave: genuinely unrelated text tends to score 0.1-0.3, genuinely
-# relevant text 0.45-0.75, leaving a gap in between for the threshold to
-# sit in. That gap has to be confirmed, not assumed.
+#     answerable questions        0.40 - 0.80
+#     near-domain, unanswerable   0.36 - 0.63   (parking, Berlin, holiday)
+#     off-topic                   0.07 - 0.13   (weather, football)
 #
-# The number is meaningless on its own. What matters is the separation
-# between the two groups for THIS knowledge base. evaluate.py prints the
-# top score for every test question, and the threshold belongs in the
-# valley between the worst should-pass score and the best should-fail
-# score. If those two overlap, no threshold works and the fix is better
-# chunking or better documents - not a different number.
-MIN_RELEVANCE_SCORE = 0.35
+# The first two groups overlap: "which electrical supplier do we use in
+# Berlin?" scores 0.63 because the supplier directory genuinely is about
+# electrical suppliers, which is higher than several real questions. No
+# threshold can separate overlapping groups, so near-domain questions are
+# refused by the system prompt, not by this number.
+#
+# That leaves this threshold one job: keep off-topic noise away from the
+# model without ever blocking a genuine answer. 0.27 is the midpoint of
+# the gap between the highest off-topic score (0.13) and the lowest
+# answerable one (0.40), leaving a margin of about 0.13 on each side.
+#
+# It is a backstop. In testing the agent never searched for off-topic
+# questions at all - it declined them without calling a tool - so the
+# threshold did not fire once. It is kept because the prompt and the
+# routing can fail, and a different model may be more eager to search.
+MIN_RELEVANCE_SCORE = 0.27
 
 
 # --------------------------------------------------------------------------
