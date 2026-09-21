@@ -24,6 +24,8 @@ if statement in the agent loop.
 
 import json
 
+import openai
+
 import knowledge
 import tickets
 
@@ -144,10 +146,11 @@ def run_tool(name: str, arguments_json: str) -> tuple[str, dict]:
         only inspect the final prose, which tells us what the assistant
         said but not what it was working from.
 
-    Never raises. Every failure - unparseable arguments, an unknown tool
-    name, a missing argument - comes back as text the model can read and
-    explain to the user, because an exception here would kill the
-    conversation over something recoverable.
+    Never raises for anything the model or Azure can cause. Unparseable
+    arguments, an unknown tool name, a missing argument, or an Azure error
+    during search all come back as text the model can read and explain to
+    the user, because an exception here would end the turn over something
+    recoverable. A genuine bug in our own code is left to fail loudly.
     """
     # The model produces these arguments as a JSON string. It is almost
     # always valid, but "almost always" is not a guarantee we can build
@@ -166,7 +169,27 @@ def run_tool(name: str, arguments_json: str) -> tuple[str, dict]:
         if not query:
             return ("No search query was provided.", {})
 
-        result = knowledge.search(query)
+        try:
+            result = knowledge.search(query)
+        except openai.APIError as error:
+            # Azure failed: a timeout, a rate limit, or - as happened once
+            # during testing - the embedding deployment briefly returning
+            # 404. Before this was caught, one failed search ended the
+            # whole turn, taking a perfectly good ticket answer down with
+            # it on a mixed question. Now the model is told search is
+            # unavailable and can still answer everything else.
+            #
+            # Only Azure's own errors are caught. A bug in our code is not
+            # an APIError and should still fail loudly.
+            return (
+                "The document search is temporarily unavailable "
+                f"({type(error).__name__}). Tell the user you could not "
+                "check the policy documents right now and suggest trying "
+                "again shortly. Do not answer the policy part from general "
+                "knowledge.",
+                {"search_error": type(error).__name__},
+            )
+
         metadata = {
             "top_score": result.top_score,
             "sources": [chunk.citation() for chunk, _ in result.matches],
