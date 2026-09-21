@@ -1,0 +1,8 @@
+# Only two dependencies. Everything else is the Python standard library.
+#
+# openai        - the official SDK, used in its Azure OpenAI flavour
+#                 (AzureOpenAI client) for both chat and embeddings
+# python-dotenv - loads the .env file so secrets stay out of the code
+
+openai>=1.40.0
+python-dotenv>=1.0.0

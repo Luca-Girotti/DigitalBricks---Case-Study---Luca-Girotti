@@ -1,0 +1,14 @@
+# Secrets - never commit the real .env, only .env.example
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# The task PDF is not part of the solution
+*.pdf
