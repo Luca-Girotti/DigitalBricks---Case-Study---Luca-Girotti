@@ -13,18 +13,27 @@ actually did against what eval_questions.py said it should do - which
 tools it chose, whether it grounded or refused, and whether the answer
 contains (or avoids) the expected wording.
 
-Second, it produces the numbers needed to set MIN_RELEVANCE_SCORE. The
-threshold should sit in the gap between the lowest-scoring question that
-SHOULD be answered and the highest-scoring question that should NOT be.
-The summary at the end prints exactly those two numbers and suggests the
-midpoint. If they overlap, no threshold works and the real fix is better
-chunking or clearer documents - so the summary says that too, rather
-than quietly recommending a number that cannot work.
+Second, it produces the numbers needed to set MIN_RELEVANCE_SCORE, by
+printing the best retrieval score for three groups of question:
+
+- answerable      - the knowledge base covers it
+- near-domain     - sounds like it belongs, but the knowledge base does
+                    not cover it (parking, holiday, a site we lack)
+- off-topic       - nothing to do with facilities at all (the weather)
+
+If the answerable and near-domain groups separate cleanly, the threshold
+goes between them and does all the refusing on its own. On this corpus
+they overlap - a question about a site Northwind does not have scores
+higher than some genuine questions - so the system prompt has to catch
+near-domain questions, and the threshold's job shrinks to keeping
+off-topic noise away from the model without ever blocking a real answer.
+The summary says which situation applies and suggests a number for it.
 """
 
 from agent import AgentReply, Assistant
-from eval_questions import EVAL_CASES, EvalCase
+from eval_questions import EVAL_CASES, OFF_TOPIC_PROBES, EvalCase
 import config
+import knowledge
 
 
 def check_case(case: EvalCase, reply: AgentReply) -> list[str]:
@@ -78,25 +87,35 @@ def check_case(case: EvalCase, reply: AgentReply) -> list[str]:
 
 
 def run_case(case: EvalCase) -> AgentReply:
-    """Run one case end to end and return the final reply.
+    """Run one case end to end.
 
     A fresh Assistant per case, so cases cannot contaminate each other.
-    Multi-turn cases run every turn in order; only the reply to the last
-    turn is checked, because that is the one the expectations describe.
+    Multi-turn cases run every turn in order.
+
+    The answer checked is the reply to the last turn. The tools and
+    sources, though, are gathered from the whole conversation. The system
+    prompt defines grounded as "text a tool returned in this
+    conversation", so a follow-up answered from a section retrieved one
+    turn earlier is grounded, not a guess. An earlier version counted the
+    last turn only, and failed M1 whenever the model - correctly - reused
+    what it had already retrieved instead of searching again.
 
     Args:
         case: The case to run.
 
     Returns:
-        The AgentReply from the final turn.
+        An AgentReply combining the final answer with the tools, sources
+        and best score from every turn.
     """
     assistant = Assistant()
+    replies = [assistant.ask(turn) for turn in case.turns]
 
-    reply = None
-    for turn in case.turns:
-        reply = assistant.ask(turn)
-
-    return reply
+    return AgentReply(
+        answer=replies[-1].answer,
+        tools_called=[tool for reply in replies for tool in reply.tools_called],
+        sources=[source for reply in replies for source in reply.sources],
+        top_score=max(reply.top_score for reply in replies),
+    )
 
 
 def main() -> None:
@@ -154,12 +173,13 @@ def _print_threshold_analysis(
     should_retrieve: list[tuple[str, float]],
     should_not_retrieve: list[tuple[str, float]],
 ) -> None:
-    """Print the two score groups and suggest a relevance threshold.
+    """Print the three score groups and suggest a relevance threshold.
 
     Args:
         should_retrieve: (case id, top score) for questions the knowledge
             base can genuinely answer.
-        should_not_retrieve: the same, for questions it cannot.
+        should_not_retrieve: the same, for near-domain questions it
+            cannot.
     """
     print("-" * 64)
     print("THRESHOLD ANALYSIS")
@@ -169,30 +189,56 @@ def _print_threshold_analysis(
         print("Not enough data in both groups to suggest a threshold.\n")
         return
 
-    print("\nShould be answered (want these ABOVE the threshold):")
+    print("\nAnswerable (must stay ABOVE the threshold):")
     for case_id, score in sorted(should_retrieve, key=lambda pair: -pair[1]):
         print(f"   {score:.2f}  {case_id}")
 
-    print("\nShould be refused (want these BELOW the threshold):")
+    print("\nNear-domain, should be refused:")
     for case_id, score in sorted(should_not_retrieve, key=lambda pair: -pair[1]):
         print(f"   {score:.2f}  {case_id}")
 
+    # Off-topic questions are scored straight against the index rather
+    # than run through the agent, because the agent never searches for
+    # them - it declines without calling a tool at all. What we want to
+    # know is what the threshold WOULD see if a search were made, since
+    # that is the situation a backstop exists for.
+    off_topic = [(query, knowledge.search(query).top_score) for query in OFF_TOPIC_PROBES]
+    print("\nOff-topic, scored directly against the index:")
+    for query, score in sorted(off_topic, key=lambda pair: -pair[1]):
+        print(f"   {score:.2f}  {query}")
+
     worst_passer = min(score for _, score in should_retrieve)
     best_failer = max(score for _, score in should_not_retrieve)
+    noisiest_off_topic = max(score for _, score in off_topic)
 
-    print(f"\nLowest score that should pass:  {worst_passer:.2f}")
-    print(f"Highest score that should fail: {best_failer:.2f}")
+    print(f"\nLowest answerable:        {worst_passer:.2f}")
+    print(f"Highest near-domain:      {best_failer:.2f}")
+    print(f"Highest off-topic:        {noisiest_off_topic:.2f}")
 
     if worst_passer > best_failer:
         suggested = (worst_passer + best_failer) / 2
-        print(f"\nClean gap. Suggested MIN_RELEVANCE_SCORE: {suggested:.2f}")
+        print(
+            "\nAnswerable and near-domain separate cleanly, so the threshold"
+            "\ncan do all the refusing by itself."
+            f"\nSuggested MIN_RELEVANCE_SCORE: {suggested:.2f}"
+        )
+    elif worst_passer > noisiest_off_topic:
+        suggested = (worst_passer + noisiest_off_topic) / 2
+        print(
+            "\nAnswerable and near-domain OVERLAP, so no threshold can"
+            "\nseparate them - the system prompt has to refuse those, by"
+            "\nnoticing the retrieved text does not cover what was asked."
+            "\n"
+            "\nThe threshold's job is therefore to keep off-topic noise away"
+            "\nfrom the model without ever blocking a real answer: the"
+            "\nmidpoint between the highest off-topic and lowest answerable."
+            f"\nSuggested MIN_RELEVANCE_SCORE: {suggested:.2f}"
+        )
     else:
         print(
-            "\nThe two groups OVERLAP, so no threshold separates them."
-            "\nA question that should be refused scores higher than one that"
-            "\nshould be answered. Changing the number cannot fix this - the"
-            "\nsystem prompt has to catch these cases by noticing that the"
-            "\nretrieved text does not actually cover what was asked."
+            "\nEven off-topic questions score as high as answerable ones."
+            "\nNo threshold is safe here. That points at the documents or"
+            "\nthe chunking, not at this number."
         )
 
     print()
