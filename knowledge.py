@@ -45,8 +45,9 @@ class Chunk:
             top-level "# " heading. Used in citations.
         section: The "## " heading this chunk sits under. Also used in
             citations, so the assistant can point at the exact part.
-        text: The section's body text with its heading included. This is
-            what gets embedded and what the model reads.
+        text: The section's body text, preceded by the document title
+            and the section heading. This is what gets embedded and what
+            the model reads.
         embedding: The vector representation, filled in later by
             build_index(). Empty until then.
     """
@@ -108,11 +109,20 @@ def split_into_chunks(markdown_text: str, fallback_title: str) -> list[Chunk]:
                 Chunk(
                     document=document_title,
                     section=current_section,
-                    # The heading is deliberately included in the text.
-                    # "Who approves an after-hours callout" is a strong
-                    # signal for the embedding, and losing it would make
-                    # the chunk noticeably harder to match.
-                    text=f"## {current_section}\n\n{body}",
+                    # Both the document title and the section heading are
+                    # included in the embedded text, not just the body.
+                    #
+                    # The section heading alone was not enough. The
+                    # evaluation showed "What is the SLA for a P2 ticket?"
+                    # retrieving the Client complaints section, and
+                    # "P2 SLA" retrieving P4 - Low. The P2 chunk never
+                    # contained the words "Service Level Agreement" -
+                    # those lived only in the document title - so the four
+                    # priority chunks looked almost identical to the
+                    # embedding model. Prepending the title gives every
+                    # chunk back the context it lost when it was cut out
+                    # of its document.
+                    text=f"# {document_title}\n## {current_section}\n\n{body}",
                 )
             )
 
