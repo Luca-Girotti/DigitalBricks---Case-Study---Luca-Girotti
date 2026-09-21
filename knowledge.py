@@ -167,6 +167,152 @@ def load_chunks(directory: Path | None = None) -> list[Chunk]:
     return all_chunks
 
 
+# --------------------------------------------------------------------------
+# Embedding and search
+#
+# Everything below this line needs an Azure connection. Everything above
+# it - loading and chunking - runs offline.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class SearchResult:
+    """What one search returned.
+
+    Attributes:
+        matches: The chunks that scored at or above the relevance
+            threshold, best first, each paired with its score. Empty when
+            nothing was good enough.
+        top_score: The best score seen, whether or not it cleared the
+            threshold. Kept separately because evaluate.py needs to see
+            the near-misses in order to tune the threshold - if we only
+            reported what passed, we could never tell how close a failed
+            search came.
+    """
+
+    matches: list[tuple[Chunk, float]]
+    top_score: float
+
+
+def similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two embedding vectors.
+
+    Cosine similarity is normally the dot product divided by both
+    vectors' lengths. Azure's text-embedding-3 models return vectors that
+    are already unit length, so that division is by 1 x 1 and disappears,
+    leaving just the dot product.
+
+    Args:
+        a: First vector.
+        b: Second vector, the same length as the first.
+
+    Returns:
+        A score, in practice between roughly 0.0 (unrelated) and 1.0
+        (the same meaning).
+    """
+    return sum(x * y for x, y in zip(a, b))
+
+
+def embed(texts: list[str]) -> list[list[float]]:
+    """Turn a list of strings into a list of vectors.
+
+    Sent as a single batched request rather than one call per string.
+    All 37 chunks go to Azure in one round trip, which is both faster and
+    cheaper than 37 separate calls.
+
+    Args:
+        texts: The strings to embed.
+
+    Returns:
+        One vector per input string, in the same order.
+    """
+    response = config.get_client().embeddings.create(
+        model=config.EMBEDDING_DEPLOYMENT,
+        input=texts,
+    )
+    return [item.embedding for item in response.data]
+
+
+# The built index, held here after the first search so that we embed the
+# knowledge base once per process rather than once per question.
+_index: list[Chunk] | None = None
+
+
+def get_index() -> list[Chunk]:
+    """Return the chunks with their embeddings filled in.
+
+    Builds the index on first call - reading the documents, chunking
+    them, and embedding every chunk in one batched request - then reuses
+    it for the rest of the process.
+
+    Rebuilding per question would mean an Azure call and a few seconds of
+    delay every single time, for a knowledge base that does not change
+    while the program is running.
+
+    Returns:
+        The list of Chunk objects, each with a populated embedding.
+    """
+    global _index
+
+    if _index is None:
+        chunks = load_chunks()
+        vectors = embed([chunk.text for chunk in chunks])
+        for chunk, vector in zip(chunks, vectors):
+            chunk.embedding = vector
+        _index = chunks
+
+    return _index
+
+
+def search(
+    query: str,
+    top_k: int | None = None,
+    min_score: float | None = None,
+) -> SearchResult:
+    """Find the chunks most relevant to a question.
+
+    Embeds the query, scores it against every chunk, keeps the best few,
+    and discards anything below the relevance threshold.
+
+    That last step is the one that matters. Similarity search always
+    returns a ranking, even when nothing in the corpus is relevant - ask
+    about parking and it will still hand back the three least unrelated
+    chunks. Passing those to the model invites it to build a plausible
+    answer out of unrelated text. The threshold throws them away first,
+    so the model sees an empty result and can say it does not know.
+
+    Args:
+        query: The user's question, or whatever the model chose to search
+            for on their behalf.
+        top_k: How many chunks to keep. Defaults to config.SEARCH_TOP_K.
+        min_score: The relevance floor. Defaults to
+            config.MIN_RELEVANCE_SCORE.
+
+    Returns:
+        A SearchResult. Its matches list is empty when nothing cleared
+        the threshold, but top_score still reports how close the best
+        candidate came.
+    """
+    top_k = top_k if top_k is not None else config.SEARCH_TOP_K
+    min_score = min_score if min_score is not None else config.MIN_RELEVANCE_SCORE
+
+    chunks = get_index()
+
+    # embed() takes and returns lists, so ask for one and unwrap it.
+    query_vector = embed([query])[0]
+
+    scored = [(chunk, similarity(query_vector, chunk.embedding)) for chunk in chunks]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+
+    # Recorded before filtering, so a failed search can still report how
+    # near it got.
+    top_score = scored[0][1] if scored else 0.0
+
+    matches = [(chunk, score) for chunk, score in scored[:top_k] if score >= min_score]
+
+    return SearchResult(matches=matches, top_score=top_score)
+
+
 if __name__ == "__main__":
     # Run "python knowledge.py" to see exactly how the documents were
     # split. Useful when tuning the chunking strategy, and a quick way to

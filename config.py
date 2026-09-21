@@ -72,8 +72,19 @@ SEARCH_TOP_K = 3
 # sounding policy out of it. That is exactly the hallucination the case
 # study warns about.
 #
-# 0.35 was chosen by running evaluate.py and looking at the actual scores
-# for questions that should succeed versus questions that should fail.
+# PROVISIONAL VALUE - not yet measured against this corpus.
+#
+# 0.35 is a starting point based on how text-embedding-3 models usually
+# behave: genuinely unrelated text tends to score 0.1-0.3, genuinely
+# relevant text 0.45-0.75, leaving a gap in between for the threshold to
+# sit in. That gap has to be confirmed, not assumed.
+#
+# The number is meaningless on its own. What matters is the separation
+# between the two groups for THIS knowledge base. evaluate.py prints the
+# top score for every test question, and the threshold belongs in the
+# valley between the worst should-pass score and the best should-fail
+# score. If those two overlap, no threshold works and the fix is better
+# chunking or better documents - not a different number.
 MIN_RELEVANCE_SCORE = 0.35
 
 
@@ -94,6 +105,44 @@ MAX_TOOL_ITERATIONS = 5
 # grounded assistant that is what we want - we are explicitly asking it
 # not to be imaginative.
 TEMPERATURE = 0.1
+
+
+# A single shared Azure client, created the first time it is asked for
+# and then reused. Two modules need one - knowledge.py for embeddings and
+# agent.py for chat - and building it in one place keeps the connection
+# details in the same file as the settings they come from.
+_client = None
+
+
+def get_client():
+    """Return the shared AzureOpenAI client, creating it on first use.
+
+    The import sits inside the function rather than at the top of the
+    file so that importing config does not require the openai package or
+    a valid key. That matters because knowledge.py and eval_questions.py
+    can both be used - for chunking and for reading the test cases -
+    with no Azure connection at all.
+
+    Returns:
+        An AzureOpenAI client configured from the environment.
+
+    Raises:
+        RuntimeError: via validate_config(), if the endpoint or key is
+            missing.
+    """
+    global _client
+
+    if _client is None:
+        validate_config()
+        from openai import AzureOpenAI
+
+        _client = AzureOpenAI(
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+        )
+
+    return _client
 
 
 def validate_config() -> None:
