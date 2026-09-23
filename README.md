@@ -7,6 +7,8 @@ says "I don't know" instead of guessing.
 
 Built for the DigitalBricks AI Developer case study.
 
+**Demo (5 min):** https://drive.google.com/file/d/1v3ZOBES9DxbFL-TepxYPd7_CBn_weDDT/view
+
 ## Quick start
 
 Needs Python 3.11+ and an Azure OpenAI resource with a chat deployment and an
